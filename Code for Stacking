@@ -1,0 +1,82 @@
+import os
+import pandas as pd
+import pydicom
+import numpy as np
+import cv2
+
+# Input paths
+excel_path = "/kaggle/input/lesion-notesr/MSKCC-RepeatCT-Lesion-notes-for-RIDER (2).xlsx"
+dicom_base_path = "/kaggle/input/rider-datasetfinal/Rider/manifest-1719341001457/RIDER Lung CT"
+output_path = "/kaggle/working/"
+
+# Read Excel data
+df = pd.read_excel(excel_path)
+
+# Ensure output directory exists
+os.makedirs(output_path, exist_ok=True)
+
+# Iterate over each row
+for index, row in df.iterrows():
+    patient_id = str(row['RIDER-ID']).strip()
+    image_start_raw = row.get('z (imagenumber1)', None)
+    image_end_raw = row.get('z (imagenumber2)', None)
+
+    print(f"\nRow {index}: Patient ID = {patient_id}, Start = {image_start_raw}, End = {image_end_raw}")
+
+    if pd.isna(image_start_raw) or pd.isna(image_end_raw):
+        print("⚠️ Skipping due to missing start or end image number.")
+        continue
+
+    try:
+        start = int(image_start_raw)
+        end = int(image_end_raw)
+    except ValueError:
+        print("⚠️ Invalid image numbers, skipping.")
+        continue
+
+    # Generate filenames from start to end inclusive
+    target_filenames = [f"1-{i:03d}.dcm" for i in range(start, end + 1)]
+
+    # Locate patient directory
+    patient_dir = os.path.join(dicom_base_path, patient_id)
+    if not os.path.exists(patient_dir):
+        print(f"❌ Patient folder not found: {patient_dir}")
+        continue
+
+    # Dictionary to collect slice images across all subfolders
+    slice_to_files = {fname: [] for fname in target_filenames}
+
+    # Walk through all subfolders and collect relevant DICOMs
+    for root, _, files in os.walk(patient_dir):
+        for filename in files:
+            if filename in target_filenames:
+                full_path = os.path.join(root, filename)
+                slice_to_files[filename].append(full_path)
+
+    # Process each slice across subfolders
+    for slice_name, filepaths in slice_to_files.items():
+        dicom_arrays = []
+
+        for filepath in filepaths:
+            try:
+                ds = pydicom.dcmread(filepath)
+                pixel_array = ds.pixel_array
+
+                # Normalize to 8-bit for PNG
+                norm_img = cv2.normalize(pixel_array, None, 0, 255, cv2.NORM_MINMAX)
+                norm_img = norm_img.astype(np.uint8)
+
+                dicom_arrays.append(norm_img)
+            except Exception as e:
+                print(f"⚠️ Failed to read or process DICOM {filepath}: {e}")
+
+        if dicom_arrays:
+            volume = np.stack(dicom_arrays, axis=0)
+            mip_image = np.max(volume, axis=0)
+
+            slice_id = slice_name.split('.')[0]
+            output_file = os.path.join(output_path, f"{patient_id}_MIP_{slice_id}.png")
+            cv2.imwrite(output_file, mip_image)
+            print(f"📸 Saved MIP PNG for {patient_id} slice {slice_id}: {output_file}")
+
+print("\n✅ Done processing and saving MIP images grouped by slice number for each patient.")
