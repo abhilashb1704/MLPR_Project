@@ -1,0 +1,191 @@
+import os
+import numpy as np
+import cv2
+import pydicom
+import tensorflow as tf
+from tensorflow.keras import layers, models
+import matplotlib.pyplot as plt
+
+# --- Path setup (from your query) ---
+train_img_dirs = [
+    "/kaggle/input/training-tumorous/Training",
+    "/kaggle/input/non-tumoroustraining/Non-tumorous(training)"
+]
+val_img_dirs = [
+    "/kaggle/input/validationtumorous/Val-tumorous",
+    "/kaggle/input/non-tumorousvalidation/Non-tumorous(val)"
+]
+train_mask_dirs = [
+    "/kaggle/input/segmented-tumourous/masks-tumtum",
+    "/kaggle/input/segmented-tumourous/masks-non-tumor/Non-tumorous(training)"
+]
+val_mask_dirs = [
+    "/kaggle/input/segmented-tumourous/masks-tumtum",
+    "/kaggle/input/segmented-tumourous/masks-non-tumor/Non-tumorous(val)"
+]
+test_tumor_dir = "/kaggle/input/testtumorous/Test-tumorous"
+test_nontumor_dir = "/kaggle/input/non-tumoroustest/Non-tumorous(test)"
+tumor_mask_root = "/kaggle/input/tumorous-test-masks/masks-tumorous"
+nontumor_mask_root = "/kaggle/input/non-tumorous-test-masks/masks-non-tumorous"
+
+IMG_SIZE = (256, 256)
+
+# --- Data loading utilities ---
+def load_dicom_image(path, img_size=IMG_SIZE):
+    dcm = pydicom.dcmread(path)
+    img = dcm.pixel_array.astype(np.float32)
+    img = cv2.resize(img, img_size)
+    img = img / np.max(img) if np.max(img) > 0 else img
+    return img
+
+def load_mask(path, img_size=IMG_SIZE):
+    mask = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
+    mask = cv2.resize(mask, img_size)
+    return (mask > 127).astype(np.float32)
+
+def get_image_mask_pairs(img_dirs, mask_dirs, img_ext=".dcm", mask_ext=".png"):
+    img_paths, mask_paths = [], []
+    for img_dir, mask_dir in zip(img_dirs, mask_dirs):
+        for root, _, files in os.walk(img_dir):
+            for file in files:
+                if file.endswith(img_ext):
+                    img_path = os.path.join(root, file)
+                    # Assume mask has same relative path and filename (but .png)
+                    rel_path = os.path.relpath(img_path, img_dir)
+                    mask_path = os.path.join(mask_dir, rel_path)
+                    mask_path = os.path.splitext(mask_path)[0] + mask_ext
+                    if os.path.exists(mask_path):
+                        img_paths.append(img_path)
+                        mask_paths.append(mask_path)
+    return img_paths, mask_paths
+
+def get_test_image_paths(test_dirs, img_ext=".dcm"):
+    img_paths = []
+    for test_dir in test_dirs:
+        for root, _, files in os.walk(test_dir):
+            for file in files:
+                if file.endswith(img_ext):
+                    img_paths.append(os.path.join(root, file))
+    return img_paths
+
+# --- Data generator for batch training ---
+class LungSegmentationGenerator(tf.keras.utils.Sequence):
+    def __init__(self, img_paths, mask_paths, batch_size=8, img_size=IMG_SIZE, shuffle=True):
+        self.img_paths = img_paths
+        self.mask_paths = mask_paths
+        self.batch_size = batch_size
+        self.img_size = img_size
+        self.shuffle = shuffle
+        self.on_epoch_end()
+
+    def __len__(self):
+        return int(np.ceil(len(self.img_paths) / self.batch_size))
+
+    def __getitem__(self, idx):
+        batch_imgs = self.img_paths[idx * self.batch_size:(idx + 1) * self.batch_size]
+        batch_masks = self.mask_paths[idx * self.batch_size:(idx + 1) * self.batch_size]
+        X, y = [], []
+        for img_path, mask_path in zip(batch_imgs, batch_masks):
+            img = load_dicom_image(img_path, self.img_size)
+            mask = load_mask(mask_path, self.img_size)
+            X.append(img[..., np.newaxis])
+            y.append(mask[..., np.newaxis])
+        return np.array(X), np.array(y)
+
+    def on_epoch_end(self):
+        if self.shuffle:
+            temp = list(zip(self.img_paths, self.mask_paths))
+            np.random.shuffle(temp)
+            self.img_paths, self.mask_paths = zip(*temp)
+
+# --- Dice + BCE loss and metric ---
+def dice_coef(y_true, y_pred, smooth=1):
+    y_true_f = tf.keras.backend.flatten(y_true)
+    y_pred_f = tf.keras.backend.flatten(y_pred)
+    intersection = tf.reduce_sum(y_true_f * y_pred_f)
+    return (2. * intersection + smooth) / (tf.reduce_sum(y_true_f) + tf.reduce_sum(y_pred_f) + smooth)
+
+def dice_loss(y_true, y_pred):
+    return 1 - dice_coef(y_true, y_pred)
+
+def combined_loss(y_true, y_pred):
+    bce = tf.keras.losses.binary_crossentropy(y_true, y_pred)
+    d_loss = dice_loss(y_true, y_pred)
+    return bce + d_loss
+
+# --- U-Net Model ---
+def conv_block(x, filters):
+    x = layers.Conv2D(filters, 3, activation='relu', padding='same')(x)
+    x = layers.Conv2D(filters, 3, activation='relu', padding='same')(x)
+    return x
+
+def encoder_block(x, filters):
+    f = conv_block(x, filters)
+    p = layers.MaxPooling2D(2)(f)
+    return f, p
+
+def decoder_block(x, skip, filters):
+    x = layers.UpSampling2D(2)(x)
+    x = layers.Concatenate()([x, skip])
+    x = conv_block(x, filters)
+    return x
+
+def build_unet(input_shape=(256, 256, 1)):
+    inputs = layers.Input(input_shape)
+    f1, p1 = encoder_block(inputs, 64)
+    f2, p2 = encoder_block(p1, 128)
+    f3, p3 = encoder_block(p2, 256)
+    bottleneck = conv_block(p3, 512)
+    d1 = decoder_block(bottleneck, f3, 256)
+    d2 = decoder_block(d1, f2, 128)
+    d3 = decoder_block(d2, f1, 64)
+    outputs = layers.Conv2D(1, 1, activation='sigmoid')(d3)
+    return models.Model(inputs, outputs)
+
+# --- Prepare file lists ---
+train_img_paths, train_mask_paths = get_image_mask_pairs(train_img_dirs, train_mask_dirs)
+val_img_paths, val_mask_paths = get_image_mask_pairs(val_img_dirs, val_mask_dirs)
+test_img_paths = get_test_image_paths([test_tumor_dir, test_nontumor_dir])
+
+# --- Generators ---
+train_gen = LungSegmentationGenerator(train_img_paths, train_mask_paths, batch_size=8, img_size=IMG_SIZE)
+val_gen = LungSegmentationGenerator(val_img_paths, val_mask_paths, batch_size=8, img_size=IMG_SIZE, shuffle=False)
+
+# --- Model ---
+model = build_unet(input_shape=(IMG_SIZE[0], IMG_SIZE[1], 1))
+model.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=1e-3),
+              loss=combined_loss,
+              metrics=[dice_coef])
+
+print(model.summary())
+
+# --- Training ---
+history = model.fit(train_gen, validation_data=val_gen, epochs=60)
+
+# --- Test Set Inference and Saving ---
+def predict_and_save(model, test_img_paths, out_dir, img_size=IMG_SIZE):
+    os.makedirs(out_dir, exist_ok=True)
+    for img_path in test_img_paths:
+        img = load_dicom_image(img_path, img_size)
+        X = img[np.newaxis, ..., np.newaxis]
+        pred = model.predict(X)[0,...,0]
+        pred_mask = (pred > 0.5).astype(np.uint8) * 255
+        # Save as PNG (or you can save as DICOM SEG if needed)
+        base = os.path.basename(img_path).replace('.dcm', '_pred.png')
+        cv2.imwrite(os.path.join(out_dir, base), pred_mask)
+
+# After training:
+predict_and_save(model, test_img_paths, out_dir='./predicted_masks', img_size=IMG_SIZE)
+
+# --- Example visualization for a batch ---
+X_val, y_val = val_gen[0]
+preds = model.predict(X_val)
+
+plt.figure(figsize=(12,6))
+for i in range(min(3, len(X_val))):
+    plt.subplot(3,4,4*i+1); plt.imshow(X_val[i,...,0], cmap='gray'); plt.title('Image')
+    plt.subplot(3,4,4*i+2); plt.imshow(y_val[i,...,0], cmap='gray'); plt.title('Mask')
+    plt.subplot(3,4,4*i+3); plt.imshow(preds[i,...,0], cmap='gray'); plt.title('Raw Pred')
+    plt.subplot(3,4,4*i+4); plt.imshow(preds[i,...,0]>0.5, cmap='gray'); plt.title('Pred>0.5')
+plt.tight_layout()
+plt.show() 
