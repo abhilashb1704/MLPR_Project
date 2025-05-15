@@ -1,0 +1,86 @@
+import os
+import numpy as np
+import pandas as pd
+import cv2
+import re
+from collections import defaultdict
+
+# CONFIGURATION
+csv_path = "/kaggle/input/segmentation-metadatav2/metadata.csv"
+base_dirs = [
+    "/kaggle/input/training-tumorous/Training",
+    "/kaggle/input/validationtumorous/Val-tumorous"
+]
+output_mask_dir = "./masks-tumtum"
+ellipse_axes = (12, 16)  # (x_radius, y_radius)
+
+# STEP 1: Load Metadata
+df = pd.read_csv(csv_path)
+df = df.dropna(subset=[
+    "x (in pixel)", "x (in pixel).1",
+    "y(in pixel)", "y(in pixel).1",
+    "z (imagenumber1)", "z (imagenumber2)"
+])
+
+# STEP 2: Build tumor map with inverted y-axis
+tumor_map = defaultdict(dict)
+for _, row in df.iterrows():
+    rider_id = row["RIDER-ID"]
+    x = int(round((row["x (in pixel)"] + row["x (in pixel).1"]) / 2))
+    y = int(round((row["y(in pixel)"] + row["y(in pixel).1"]) / 2))
+    y = 511 - y  # Invert y-axis for OpenCV drawing
+    z1 = int(row["z (imagenumber1)"])
+    z2 = int(row["z (imagenumber2)"])
+    z_start, z_end = min(z1, z2), max(z1, z2)
+
+    for z in range(z_start, z_end + 1):
+        tumor_map[rider_id][z] = (x, y)
+
+# STEP 3: Helper functions
+def extract_slice_index(filename):
+    try:
+        return int(filename.split('-')[-1].replace('.dcm', '').lstrip("0") or "0")
+    except:
+        return None
+
+def create_ellipse_mask(shape, center, axes):
+    mask = np.zeros(shape, dtype=np.uint8)
+    center = (np.clip(center[0], 0, shape[1] - 1), np.clip(center[1], 0, shape[0] - 1))
+    cv2.ellipse(mask, center=center, axes=axes, angle=0, startAngle=0, endAngle=360, color=255, thickness=-1)
+    return mask
+
+def extract_rider_id(path):
+    match = re.search(r'RIDER-\d{10}', path)
+    return match.group(0) if match else None
+
+# STEP 4: Generate one mask per .dcm file with correct y-inversion
+os.makedirs(output_mask_dir, exist_ok=True)
+
+for base_dir in base_dirs:
+    for root, _, files in os.walk(base_dir):
+        for file in files:
+            if not file.endswith(".dcm"):
+                continue
+
+            full_path = os.path.join(root, file)
+            rider_id = extract_rider_id(full_path)
+            slice_num = extract_slice_index(file)
+            if slice_num is None or rider_id is None:
+                continue
+
+            filename_base = file.replace(".dcm", "").replace("/", "_")
+            patient_dir = os.path.join(output_mask_dir, rider_id)
+            os.makedirs(patient_dir, exist_ok=True)
+            output_path = os.path.join(patient_dir, f"{filename_base}.png")
+
+            if rider_id in tumor_map and slice_num in tumor_map[rider_id]:
+                x, y = tumor_map[rider_id][slice_num]
+                print(f"✅ Drawing ellipse for {rider_id} slice {slice_num} at ({x}, {y})")
+                mask = create_ellipse_mask((512, 512), (x, y), ellipse_axes)
+            else:
+                print(f"⛔ No match for {rider_id} slice {slice_num}")
+                mask = np.zeros((512, 512), dtype=np.uint8)
+
+            cv2.imwrite(output_path, mask)
+
+print("✅ Done: Elliptical pseudo-masks created for all DICOM files with y-axis flipped.")
