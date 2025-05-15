@@ -75,12 +75,12 @@ for base_dir in base_dirs:
 
             if rider_id in tumor_map and slice_num in tumor_map[rider_id]:
                 x, y = tumor_map[rider_id][slice_num]
-                print(f"✅ Drawing ellipse for {rider_id} slice {slice_num} at ({x}, {y})")
+                print(f" Drawing ellipse for {rider_id} slice {slice_num} at ({x}, {y})")
                 mask = create_ellipse_mask((512, 512), (x, y), ellipse_axes)
             else:
-                print(f"⛔ No match for {rider_id} slice {slice_num}")
+                print(f" No match for {rider_id} slice {slice_num}")
                 mask = np.zeros((512, 512), dtype=np.uint8)
 
             cv2.imwrite(output_path, mask)
 
-print("✅ Done: Elliptical pseudo-masks created for all DICOM files with y-axis flipped.")
+print(" Done: Elliptical pseudo-masks created for all DICOM files with y-axis flipped.")
