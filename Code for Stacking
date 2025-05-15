@@ -24,14 +24,14 @@ for index, row in df.iterrows():
     print(f"\nRow {index}: Patient ID = {patient_id}, Start = {image_start_raw}, End = {image_end_raw}")
 
     if pd.isna(image_start_raw) or pd.isna(image_end_raw):
-        print("⚠️ Skipping due to missing start or end image number.")
+        print("Skipping due to missing start or end image number.")
         continue
 
     try:
         start = int(image_start_raw)
         end = int(image_end_raw)
     except ValueError:
-        print("⚠️ Invalid image numbers, skipping.")
+        print("Invalid image numbers, skipping.")
         continue
 
     # Generate filenames from start to end inclusive
@@ -40,7 +40,7 @@ for index, row in df.iterrows():
     # Locate patient directory
     patient_dir = os.path.join(dicom_base_path, patient_id)
     if not os.path.exists(patient_dir):
-        print(f"❌ Patient folder not found: {patient_dir}")
+        print(f"Patient folder not found: {patient_dir}")
         continue
 
     # Dictionary to collect slice images across all subfolders
@@ -68,7 +68,7 @@ for index, row in df.iterrows():
 
                 dicom_arrays.append(norm_img)
             except Exception as e:
-                print(f"⚠️ Failed to read or process DICOM {filepath}: {e}")
+                print(f" Failed to read or process DICOM {filepath}: {e}")
 
         if dicom_arrays:
             volume = np.stack(dicom_arrays, axis=0)
@@ -79,4 +79,4 @@ for index, row in df.iterrows():
             cv2.imwrite(output_file, mip_image)
             print(f"📸 Saved MIP PNG for {patient_id} slice {slice_id}: {output_file}")
 
-print("\n✅ Done processing and saving MIP images grouped by slice number for each patient.")
+print("\n Done processing and saving MIP images grouped by slice number for each patient.")
