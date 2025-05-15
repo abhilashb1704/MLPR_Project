@@ -1,12 +1,20 @@
 import os
-import numpy as np
+import glob
 import cv2
-import pydicom
+import numpy as np
 import tensorflow as tf
-from tensorflow.keras import layers, models
+from tensorflow.keras import layers, models, optimizers
+from sklearn.utils import shuffle
+from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau
+import segmentation_models as sm
+import pydicom
 import matplotlib.pyplot as plt
 
-# --- Path setup (from your query) ---
+os.environ["SM_FRAMEWORK"] = "tf.keras"
+sm.set_framework('tf.keras')
+sm.framework()
+
+# ---------- Directory Paths ----------
 train_img_dirs = [
     "/kaggle/input/training-tumorous/Training",
     "/kaggle/input/non-tumoroustraining/Non-tumorous(training)"
@@ -23,169 +31,256 @@ val_mask_dirs = [
     "/kaggle/input/segmented-tumourous/masks-tumtum",
     "/kaggle/input/segmented-tumourous/masks-non-tumor/Non-tumorous(val)"
 ]
-test_tumor_dir = "/kaggle/input/testtumorous/Test-tumorous"
-test_nontumor_dir = "/kaggle/input/non-tumoroustest/Non-tumorous(test)"
-tumor_mask_root = "/kaggle/input/tumorous-test-masks/masks-tumorous"
-nontumor_mask_root = "/kaggle/input/non-tumorous-test-masks/masks-non-tumorous"
 
-IMG_SIZE = (256, 256)
+# --- Define your test directories here! ---
+test_img_dirs = [
+    "/kaggle/input/testtumorous/Test-tumorous",
+    "/kaggle/input/non-tumoroustest/Non-tumorous(test)"
+]
+test_mask_dirs = [
+    "/kaggle/input/tumorous-test-masks/masks-tumorous",
+    "/kaggle/input/non-tumorous-test-masks/masks-non-tumorous"
+]
 
-# --- Data loading utilities ---
-def load_dicom_image(path, img_size=IMG_SIZE):
-    dcm = pydicom.dcmread(path)
-    img = dcm.pixel_array.astype(np.float32)
-    img = cv2.resize(img, img_size)
-    img = img / np.max(img) if np.max(img) > 0 else img
-    return img
+# ---------- Utility: Recursively Collect Files ----------
+def recursive_collect_files(dirs, exts):
+    files = []
+    for d in dirs:
+        for ext in exts:
+            files.extend(glob.glob(os.path.join(d, '', ext), recursive=True))
+    return sorted(files)
 
-def load_mask(path, img_size=IMG_SIZE):
-    mask = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
-    mask = cv2.resize(mask, img_size)
-    return (mask > 127).astype(np.float32)
+# ---------- Utility: Pair Images and Masks by Filename ----------
+def pair_images_and_masks(image_paths, mask_paths):
+    mask_dict = {os.path.splitext(os.path.basename(m))[0]: m for m in mask_paths}
+    paired_images = []
+    paired_masks = []
+    for img in image_paths:
+        key = os.path.splitext(os.path.basename(img))[0]
+        if key in mask_dict:
+            paired_images.append(img)
+            paired_masks.append(mask_dict[key])
+        else:
+            print(f"Warning: No mask found for {img}")
+    return paired_images, paired_masks
 
-def get_image_mask_pairs(img_dirs, mask_dirs, img_ext=".dcm", mask_ext=".png"):
-    img_paths, mask_paths = [], []
-    for img_dir, mask_dir in zip(img_dirs, mask_dirs):
-        for root, _, files in os.walk(img_dir):
-            for file in files:
-                if file.endswith(img_ext):
-                    img_path = os.path.join(root, file)
-                    # Assume mask has same relative path and filename (but .png)
-                    rel_path = os.path.relpath(img_path, img_dir)
-                    mask_path = os.path.join(mask_dir, rel_path)
-                    mask_path = os.path.splitext(mask_path)[0] + mask_ext
-                    if os.path.exists(mask_path):
-                        img_paths.append(img_path)
-                        mask_paths.append(mask_path)
-    return img_paths, mask_paths
+# ---------- Collect and Pair Paths ----------
+train_image_paths = recursive_collect_files(train_img_dirs, exts=["*.dcm"])
+train_mask_paths = recursive_collect_files(train_mask_dirs, exts=["*.png"])
+val_image_paths = recursive_collect_files(val_img_dirs, exts=["*.dcm"])
+val_mask_paths = recursive_collect_files(val_mask_dirs, exts=["*.png"])
+test_image_paths = recursive_collect_files(test_img_dirs, exts=["*.dcm"])
+test_mask_paths = recursive_collect_files(test_mask_dirs, exts=["*.png"])
 
-def get_test_image_paths(test_dirs, img_ext=".dcm"):
-    img_paths = []
-    for test_dir in test_dirs:
-        for root, _, files in os.walk(test_dir):
-            for file in files:
-                if file.endswith(img_ext):
-                    img_paths.append(os.path.join(root, file))
-    return img_paths
+train_image_paths, train_mask_paths = pair_images_and_masks(train_image_paths, train_mask_paths)
+val_image_paths, val_mask_paths = pair_images_and_masks(val_image_paths, val_mask_paths)
+test_image_paths, test_mask_paths = pair_images_and_masks(test_image_paths, test_mask_paths)
 
-# --- Data generator for batch training ---
-class LungSegmentationGenerator(tf.keras.utils.Sequence):
-    def __init__(self, img_paths, mask_paths, batch_size=8, img_size=IMG_SIZE, shuffle=True):
-        self.img_paths = img_paths
-        self.mask_paths = mask_paths
-        self.batch_size = batch_size
-        self.img_size = img_size
-        self.shuffle = shuffle
-        self.on_epoch_end()
+print(f"Train images: {len(train_image_paths)} | Train masks: {len(train_mask_paths)}")
+print(f"Val images: {len(val_image_paths)} | Val masks: {len(val_mask_paths)}")
+print(f"Test images: {len(test_image_paths)} | Test masks: {len(test_mask_paths)}")
 
-    def __len__(self):
-        return int(np.ceil(len(self.img_paths) / self.batch_size))
-
-    def __getitem__(self, idx):
-        batch_imgs = self.img_paths[idx * self.batch_size:(idx + 1) * self.batch_size]
-        batch_masks = self.mask_paths[idx * self.batch_size:(idx + 1) * self.batch_size]
-        X, y = [], []
-        for img_path, mask_path in zip(batch_imgs, batch_masks):
-            img = load_dicom_image(img_path, self.img_size)
-            mask = load_mask(mask_path, self.img_size)
-            X.append(img[..., np.newaxis])
-            y.append(mask[..., np.newaxis])
-        return np.array(X), np.array(y)
-
-    def on_epoch_end(self):
-        if self.shuffle:
-            temp = list(zip(self.img_paths, self.mask_paths))
-            np.random.shuffle(temp)
-            self.img_paths, self.mask_paths = zip(*temp)
-
-# --- Dice + BCE loss and metric ---
-def dice_coef(y_true, y_pred, smooth=1):
+# ---------- Loss Functions ----------
+def dice_loss(y_true, y_pred):
     y_true_f = tf.keras.backend.flatten(y_true)
     y_pred_f = tf.keras.backend.flatten(y_pred)
-    intersection = tf.reduce_sum(y_true_f * y_pred_f)
-    return (2. * intersection + smooth) / (tf.reduce_sum(y_true_f) + tf.reduce_sum(y_pred_f) + smooth)
+    intersection = tf.keras.backend.sum(y_true_f * y_pred_f)
+    return 1 - (2. * intersection + 1e-7) / (tf.keras.backend.sum(y_true_f) + tf.keras.backend.sum(y_pred_f) + 1e-7)
 
-def dice_loss(y_true, y_pred):
-    return 1 - dice_coef(y_true, y_pred)
+def focal_loss(gamma=2., alpha=0.25):
+    def focal(y_true, y_pred):
+        y_pred = tf.keras.backend.clip(y_pred, tf.keras.backend.epsilon(), 1.0 - tf.keras.backend.epsilon())
+        cross_entropy = -y_true * tf.math.log(y_pred) - (1 - y_true) * tf.math.log(1 - y_pred)
+        weight = alpha * tf.pow(1 - y_pred, gamma) * y_true + (1 - alpha) * tf.pow(y_pred, gamma) * (1 - y_true)
+        return tf.reduce_mean(weight * cross_entropy)
+    return focal
 
 def combined_loss(y_true, y_pred):
-    bce = tf.keras.losses.binary_crossentropy(y_true, y_pred)
-    d_loss = dice_loss(y_true, y_pred)
-    return bce + d_loss
+    return dice_loss(y_true, y_pred) + focal_loss()(y_true, y_pred)
 
-# --- U-Net Model ---
-def conv_block(x, filters):
+# ---------- Segmentation Metrics ----------
+def dice_coef(y_true, y_pred, smooth=1e-7):
+    y_true_f = tf.keras.backend.flatten(y_true)
+    y_pred_f = tf.keras.backend.flatten(y_pred)
+    intersection = tf.keras.backend.sum(y_true_f * y_pred_f)
+    return (2. * intersection + smooth) / (tf.keras.backend.sum(y_true_f) + tf.keras.backend.sum(y_pred_f) + smooth)
+
+def iou_coef(y_true, y_pred, smooth=1e-7):
+    y_true_f = tf.keras.backend.flatten(y_true)
+    y_pred_f = tf.keras.backend.flatten(y_pred)
+    intersection = tf.keras.backend.sum(y_true_f * y_pred_f)
+    union = tf.keras.backend.sum(y_true_f) + tf.keras.backend.sum(y_pred_f) - intersection
+    return (intersection + smooth) / (union + smooth)
+
+# ---------- DICOM Reading and Preprocessing ----------
+def read_dicom_image(path):
+    ds = pydicom.dcmread(path)
+    img = ds.pixel_array.astype(np.float32)
+    if hasattr(ds, 'RescaleSlope') and hasattr(ds, 'RescaleIntercept'):
+        img = img * float(ds.RescaleSlope) + float(ds.RescaleIntercept)
+    img = cv2.normalize(img, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+    # Handle multi-channel images robustly
+    if img.ndim == 3:
+        if img.shape[2] == 3:
+            img = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
+        elif img.shape[2] == 4:
+            img = cv2.cvtColor(img, cv2.COLOR_RGBA2GRAY)
+        else:
+            img = img[:, :, 0]
+    elif img.ndim > 3:
+        img = img.squeeze()
+        if img.ndim == 3 and img.shape[2] in [3, 4]:
+            img = img[:, :, 0]
+    return img
+
+def preprocess_image(image, clip_percentiles=(1, 99)):
+    img = np.ascontiguousarray(image)
+    if img.ndim > 2:
+        img = img.squeeze()
+    img = img.astype(np.uint8)
+    clahe = cv2.createCLAHE(clipLimit=2.0)
+    img = clahe.apply(img)
+    p_low, p_high = np.percentile(img, clip_percentiles)
+    img = np.clip(img, p_low, p_high)
+    img = ((img - p_low) / (p_high - p_low + 1e-7)) * 255
+    return img.astype(np.uint8)
+
+# ---------- Data Generator ----------
+def data_generator(image_paths, mask_paths, batch_size=8, augment=True, use_rgb=False):
+    while True:
+        image_paths, mask_paths = shuffle(image_paths, mask_paths)
+        for i in range(0, len(image_paths), batch_size):
+            batch_imgs = []
+            batch_masks = []
+            for img_path, mask_path in zip(image_paths[i:i + batch_size], mask_paths[i:i + batch_size]):
+                try:
+                    img = read_dicom_image(img_path)
+                    assert img.ndim == 2, f"Unexpected image shape: {img.shape}"
+                    mask = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
+                    img = preprocess_image(img)
+                    img = cv2.resize(img, (256, 256))
+                    mask = cv2.resize(mask, (256, 256))
+                    if augment and np.random.rand() < 0.5:
+                        img = cv2.flip(img, 1)
+                        mask = cv2.flip(mask, 1)
+                    if augment and np.random.rand() < 0.5:
+                        angle = np.random.choice([90, 180, 270])
+                        img = np.rot90(img, k=angle // 90)
+                        mask = np.rot90(mask, k=angle // 90)
+                    if augment and np.random.rand() < 0.3:
+                        brightness = np.random.uniform(0.8, 1.2)
+                        img = np.clip(img * brightness, 0, 255)
+                    if use_rgb:
+                        img = np.stack([img] * 3, axis=-1)
+                    else:
+                        img = img[..., np.newaxis]
+                    mask = (mask > 127).astype(np.float32)[..., np.newaxis]
+                    batch_imgs.append(img / 255.0)
+                    batch_masks.append(mask)
+                except Exception as e:
+                    print(f"Error processing {img_path}: {e}")
+                    continue
+            if batch_imgs and batch_masks:
+                yield np.array(batch_imgs), np.array(batch_masks)
+
+# ---------- UNet Models ----------
+def build_pretrained_unet(input_shape=(256, 256, 3), encoder_weights='imagenet'):
+    return sm.Unet('resnet34', input_shape=input_shape, encoder_weights=encoder_weights, classes=1, activation='sigmoid')
+
+def conv_block(x, filters, dropout_rate=0.3):
     x = layers.Conv2D(filters, 3, activation='relu', padding='same')(x)
+    x = layers.Dropout(dropout_rate)(x)
     x = layers.Conv2D(filters, 3, activation='relu', padding='same')(x)
     return x
 
-def encoder_block(x, filters):
-    f = conv_block(x, filters)
-    p = layers.MaxPooling2D(2)(f)
-    return f, p
-
-def decoder_block(x, skip, filters):
-    x = layers.UpSampling2D(2)(x)
-    x = layers.Concatenate()([x, skip])
-    x = conv_block(x, filters)
-    return x
-
-def build_unet(input_shape=(256, 256, 1)):
+def build_simple_unet(input_shape=(256, 256, 1)):
     inputs = layers.Input(input_shape)
-    f1, p1 = encoder_block(inputs, 64)
-    f2, p2 = encoder_block(p1, 128)
-    f3, p3 = encoder_block(p2, 256)
-    bottleneck = conv_block(p3, 512)
-    d1 = decoder_block(bottleneck, f3, 256)
-    d2 = decoder_block(d1, f2, 128)
-    d3 = decoder_block(d2, f1, 64)
-    outputs = layers.Conv2D(1, 1, activation='sigmoid')(d3)
+    c1 = conv_block(inputs, 64)
+    p1 = layers.MaxPooling2D()(c1)
+    c2 = conv_block(p1, 128)
+    p2 = layers.MaxPooling2D()(c2)
+    c3 = conv_block(p2, 256)
+    p3 = layers.MaxPooling2D()(c3)
+    c4 = conv_block(p3, 512)
+    p4 = layers.MaxPooling2D()(c4)
+    bn = conv_block(p4, 1024)
+    u1 = layers.UpSampling2D()(bn)
+    u1 = layers.concatenate([u1, c4])
+    c5 = conv_block(u1, 512)
+    u2 = layers.UpSampling2D()(c5)
+    u2 = layers.concatenate([u2, c3])
+    c6 = conv_block(u2, 256)
+    u3 = layers.UpSampling2D()(c6)
+    u3 = layers.concatenate([u3, c2])
+    c7 = conv_block(u3, 128)
+    u4 = layers.UpSampling2D()(c7)
+    u4 = layers.concatenate([u4, c1])
+    c8 = conv_block(u4, 64)
+    outputs = layers.Conv2D(1, 1, activation='sigmoid')(c8)
     return models.Model(inputs, outputs)
 
-# --- Prepare file lists ---
-train_img_paths, train_mask_paths = get_image_mask_pairs(train_img_dirs, train_mask_dirs)
-val_img_paths, val_mask_paths = get_image_mask_pairs(val_img_dirs, val_mask_dirs)
-test_img_paths = get_test_image_paths([test_tumor_dir, test_nontumor_dir])
+# ---------- Training Setup ----------
+use_pretrained = True
+input_shape = (256, 256, 3) if use_pretrained else (256, 256, 1)
 
-# --- Generators ---
-train_gen = LungSegmentationGenerator(train_img_paths, train_mask_paths, batch_size=8, img_size=IMG_SIZE)
-val_gen = LungSegmentationGenerator(val_img_paths, val_mask_paths, batch_size=8, img_size=IMG_SIZE, shuffle=False)
+train_gen = data_generator(train_image_paths, train_mask_paths, batch_size=8, use_rgb=use_pretrained)
+val_gen = data_generator(val_image_paths, val_mask_paths, batch_size=8, use_rgb=use_pretrained)
+test_gen = data_generator(test_image_paths, test_mask_paths, batch_size=8, augment=False, use_rgb=use_pretrained)
 
-# --- Model ---
-model = build_unet(input_shape=(IMG_SIZE[0], IMG_SIZE[1], 1))
-model.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=1e-3),
-              loss=combined_loss,
-              metrics=[dice_coef])
+if use_pretrained:
+    model = build_pretrained_unet(input_shape=input_shape, encoder_weights='imagenet')
+else:
+    model = build_simple_unet(input_shape=input_shape)
 
-print(model.summary())
+model.compile(
+    optimizer=optimizers.Adam(1e-4),
+    loss=combined_loss,
+    metrics=['accuracy', dice_coef, iou_coef]
+)
 
-# --- Training ---
-history = model.fit(train_gen, validation_data=val_gen, epochs=60)
+callbacks = [
+    EarlyStopping(monitor='val_loss', patience=10, restore_best_weights=True),
+    ReduceLROnPlateau(monitor='val_loss', patience=5, factor=0.5)
+]
 
-# --- Test Set Inference and Saving ---
-def predict_and_save(model, test_img_paths, out_dir, img_size=IMG_SIZE):
-    os.makedirs(out_dir, exist_ok=True)
-    for img_path in test_img_paths:
-        img = load_dicom_image(img_path, img_size)
-        X = img[np.newaxis, ..., np.newaxis]
-        pred = model.predict(X)[0,...,0]
-        pred_mask = (pred > 0.5).astype(np.uint8) * 255
-        # Save as PNG (or you can save as DICOM SEG if needed)
-        base = os.path.basename(img_path).replace('.dcm', '_pred.png')
-        cv2.imwrite(os.path.join(out_dir, base), pred_mask)
+# ---------- Train ----------
+history = model.fit(
+    train_gen,
+    validation_data=val_gen,
+    epochs=50,
+    steps_per_epoch=max(1, len(train_image_paths) // 8),
+    validation_steps=max(1, len(val_image_paths) // 8),
+    callbacks=callbacks
+)
 
-# After training:
-predict_and_save(model, test_img_paths, out_dir='./predicted_masks', img_size=IMG_SIZE)
+# ---------- Plot Train vs. Validation Curves ----------
+plt.figure(figsize=(12, 6))
+plt.subplot(1, 2, 1)
+plt.plot(history.history['loss'], label='Train Loss')
+plt.plot(history.history['val_loss'], label='Val Loss')
+plt.legend()
+plt.xlabel('Epoch')
+plt.ylabel('Loss')
+plt.title('Loss: Train vs Val')
 
-# --- Example visualization for a batch ---
-X_val, y_val = val_gen[0]
-preds = model.predict(X_val)
-
-plt.figure(figsize=(12,6))
-for i in range(min(3, len(X_val))):
-    plt.subplot(3,4,4*i+1); plt.imshow(X_val[i,...,0], cmap='gray'); plt.title('Image')
-    plt.subplot(3,4,4*i+2); plt.imshow(y_val[i,...,0], cmap='gray'); plt.title('Mask')
-    plt.subplot(3,4,4*i+3); plt.imshow(preds[i,...,0], cmap='gray'); plt.title('Raw Pred')
-    plt.subplot(3,4,4*i+4); plt.imshow(preds[i,...,0]>0.5, cmap='gray'); plt.title('Pred>0.5')
+plt.subplot(1, 2, 2)
+plt.plot(history.history['accuracy'], label='Train Acc')
+plt.plot(history.history['val_accuracy'], label='Val Acc')
+plt.plot(history.history['dice_coef'], label='Train Dice')
+plt.plot(history.history['val_dice_coef'], label='Val Dice')
+plt.plot(history.history['iou_coef'], label='Train IoU')
+plt.plot(history.history['val_iou_coef'], label='Val IoU')
+plt.legend()
+plt.xlabel('Epoch')
+plt.ylabel('Metric')
+plt.title('Metrics: Train vs Val')
 plt.tight_layout()
-plt.show() 
+plt.show()
+
+# ---------- Evaluate on Test Set ----------
+test_steps = max(1, len(test_image_paths) // 8)
+test_scores = model.evaluate(test_gen, steps=test_steps, verbose=1)
+metric_names = model.metrics_names
+print("\nTest set scores:")
+for name, score in zip(metric_names, test_scores):
+    print(f"{name}: {score:.4f}")
